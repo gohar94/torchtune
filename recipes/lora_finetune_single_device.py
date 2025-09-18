@@ -665,9 +665,16 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
 
         return loss
 
-    def train(self) -> list:
+    def train(self, req_id: int) -> list:
         """
         The core training loop.
+
+        Args:
+            req_id (int): The request ID for the current training run.
+
+        Returns:
+            events (list): List of tuples containing (event_name, start_time, end_time) for various
+                events during training useful for profiling.
         """
 
         if self._compile:
@@ -794,26 +801,24 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
                     prof.step()
 
                     events.extend([
-                        ("batch_to_device", batch_to_device_start, batch_to_device_end),
-                        ("loss", loss_start, loss_end),
-                        ("backward", backward_start, backward_end),
-                        ("optimizer", optimizer_start, optimizer_end),
+                        (f"train::finetune::batch_to_device-{req_id}-{curr_epoch}", batch_to_device_start, batch_to_device_end),
+                        (f"train::finetune::loss-{req_id}-{curr_epoch}", loss_start, loss_end),
+                        (f"train::finetune::backward-{req_id}-{curr_epoch}", backward_start, backward_end),
+                        (f"train::finetune::optimizer-{req_id}-{curr_epoch}", optimizer_start, optimizer_end),
                     ])
 
                 epoch_checkpoint_start = time.time()
                 self.epochs_run += 1
                 start_save_checkpoint = time.perf_counter()
                 log.info("Starting checkpoint save...")
-                # checkpoint_timing = self.save_checkpoint(epoch=curr_epoch)
-                checkpoint_timing = []
+                checkpoint_timing = self.save_checkpoint(epoch=curr_epoch)
                 log.info(
                     "Checkpoint saved in {:.2f} seconds.".format(
                         time.perf_counter() - start_save_checkpoint
                     )
                 )
                 epoch_checkpoint_end = time.time()
-                events.append(("epoch_checkpoint", epoch_checkpoint_start, epoch_checkpoint_end))
-                events.extend(checkpoint_timing)
+                events.append((f"train::finetune::epoch_checkpoint-{req_id}", epoch_checkpoint_start, epoch_checkpoint_end))
 
         return events
 
