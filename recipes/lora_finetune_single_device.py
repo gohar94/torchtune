@@ -567,7 +567,7 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
 
         return sampler, dataloader
 
-    def save_checkpoint(self, epoch: int) -> None:
+    def save_checkpoint(self, epoch: int) -> list:
         """
         Checkpoint the state of the recipe. The constructed checkpoint state dict
         contains the following information:
@@ -580,6 +580,7 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
         """
         ckpt_dict = {}
 
+        ckpt_pre_start = time.time()
         intermediate_checkpoint = epoch + 1 < self.total_epochs
         # if training is in-progress, checkpoint the optimizer state as well
         if intermediate_checkpoint:
@@ -595,7 +596,9 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
 
         adapter_state_dict = get_adapter_state_dict(self._model.state_dict())
         ckpt_dict.update({training.ADAPTER_KEY: adapter_state_dict})
+        ckpt_pre_end = time.time()
 
+        cktp_merge_lora_start = time.time()
         if not self._save_adapter_weights_only:
             # Construct the full state dict with LoRA weights merged into base LLM weights
 
@@ -609,7 +612,9 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
             )
 
             ckpt_dict.update({training.MODEL_KEY: merged_state_dict})
+        cktp_merge_lora_end = time.time()
 
+        ckpt_save_start = time.time()
         adapter_config = {
             "r": self._lora_rank,
             "lora_alpha": self._lora_alpha,
@@ -628,6 +633,13 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
             intermediate_checkpoint=intermediate_checkpoint,
             adapter_only=self._save_adapter_weights_only,
         )
+        ckpt_save_end = time.time()
+
+        return [
+            ("ckpt_prep", ckpt_pre_start, ckpt_pre_end),
+            ("ckpt_merge_lora", cktp_merge_lora_start, cktp_merge_lora_end),
+            ("ckpt_save", ckpt_save_start, ckpt_save_end),
+        ]
 
     def _loss_step(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         # Shape [b, s], needed for the loss not the model
@@ -653,7 +665,7 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
 
         return loss
 
-    def train(self) -> None:
+    def train(self) -> list:
         """
         The core training loop.
         """
@@ -667,6 +679,8 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
         t0 = time.perf_counter()
         running_loss = 0
         num_tokens = 0
+
+        events = []
 
         with self._profiler as prof:
             # self.epochs_run should be non-zero when we're resuming from a checkpoint
@@ -692,7 +706,9 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
                     ):
                         torch.cuda.memory._record_memory_history()
 
+                    batch_to_device_start = time.time()
                     utils.batch_to_device(batch, self._device)
+                    batch_to_device_end = time.time()
 
                     # Calculate the number of unmasked tokens in the current batch
                     # and increment the total number of tokens seen in the step
@@ -703,10 +719,16 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
 
                     # Loss is normalized by default so we multiply by the number of tokens
                     # This way we can normalize by the total number of tokens if we're accumulating gradients
+                    loss_start = time.time()
                     current_loss = self._loss_step(batch) * current_num_tokens
                     running_loss += current_loss
-                    current_loss.backward()
+                    loss_end = time.time()
 
+                    backward_start = time.time()
+                    current_loss.backward()
+                    backward_end = time.time()
+
+                    optimizer_start = time.time()
                     # Step with optimizer
                     if (idx + 1) % self._gradient_accumulation_steps == 0:
                         training.scale_grads(self._model, 1 / num_tokens)
@@ -748,6 +770,7 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
                                 log_dict,
                                 step=self.global_step,
                             )
+                        optimizer_end = time.time()
 
                         # Reset running stats for the next step
                         running_loss = 0
@@ -770,15 +793,29 @@ class LoRAFinetuneRecipeSingleDevice(FTRecipeInterface):
                     # if the schedule cycle doesn't align with gradient accumulation.
                     prof.step()
 
+                    events.extend([
+                        ("batch_to_device", batch_to_device_start, batch_to_device_end),
+                        ("loss", loss_start, loss_end),
+                        ("backward", backward_start, backward_end),
+                        ("optimizer", optimizer_start, optimizer_end),
+                    ])
+
+                epoch_checkpoint_start = time.time()
                 self.epochs_run += 1
                 start_save_checkpoint = time.perf_counter()
                 log.info("Starting checkpoint save...")
-                self.save_checkpoint(epoch=curr_epoch)
+                # checkpoint_timing = self.save_checkpoint(epoch=curr_epoch)
+                checkpoint_timing = []
                 log.info(
                     "Checkpoint saved in {:.2f} seconds.".format(
                         time.perf_counter() - start_save_checkpoint
                     )
                 )
+                epoch_checkpoint_end = time.time()
+                events.append(("epoch_checkpoint", epoch_checkpoint_start, epoch_checkpoint_end))
+                events.extend(checkpoint_timing)
+
+        return events
 
     def cleanup(self) -> None:
         self._metric_logger.close()
